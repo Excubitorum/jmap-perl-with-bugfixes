@@ -1034,6 +1034,18 @@ sub run_backend_worker {
         my $host = $args->{imapHost} or die "imapHost required\n";
         my $port = $args->{imapPort} || 993;
         my $ssl  = $args->{imapSSL} // 2;
+        my %update = %$args;
+
+        # Editing settings (e.g. adding CalDAV/CardDAV) shouldn't force re-entering
+        # the IMAP password every time — reuse the stored one when left blank.
+        unless (length($update{username} // '')) {
+          $update{username} = $db->access_data()->{username};
+        }
+        unless (length($update{password} // '')) {
+          my $existing = $db->access_token();
+          $update{password} = $existing->[2];
+        }
+
         my $imap = Mail::IMAPTalk->new(
           Server      => $host,
           Port        => $port,
@@ -1041,10 +1053,10 @@ sub run_backend_worker {
           UseBlocking => ($ssl > 1),
         );
         die "Cannot connect to IMAP server $host:$port\n" unless $imap;
-        my $ok = $imap->login($args->{username}, $args->{password});
-        die "Login failed for $args->{username}\n" unless $ok;
+        my $ok = $imap->login($update{username}, $update{password});
+        die "Login failed for $update{username}\n" unless $ok;
         $imap->logout();
-        $db->setuser($args);
+        $db->setuser(\%update);
         return ['update_settings', $JSON::true];
       }
       if ($cmd eq 'delete') {
@@ -4407,6 +4419,45 @@ sub mgmt_api_accounts {
     return;
   }
 
+  if ($path =~ m{^/api/accounts/([^/]+)$} && $method eq 'put') {
+    my $aid = $1;
+    my $data = eval { decode_json($req->content) };
+    return $req->respond([400, 'bad request', {}, '{"error":"invalid JSON"}']) unless $data;
+    $httpd->stop_request();
+
+    warn "MGMT: Edit Account request for '$aid'\n";
+
+    my $fail = sub {
+      my $err = shift;
+      warn "MGMT: Edit Account '$aid' -> update_settings FAILED: $err\n";
+      $req->respond([500, 'error',
+        { 'Content-Type' => 'application/json' },
+        JSON::XS::encode_json({ error => "$err" })]);
+    };
+    # Only an account that exists: a worker for any other id would make it a
+    # database of its own.
+    send_backend_request('__accounts__', 'get_account', { accountid => $aid }, sub {
+      unless (shift) {
+        $req->respond([404, 'not found', { 'Content-Type' => 'application/json' },
+          '{"error":"not found"}']);
+        return;
+      }
+      send_backend_request($aid, 'update_settings', $data, sub {
+        warn "MGMT: Edit Account '$aid' -> update_settings OK\n";
+        # Drop our end of the worker's socket so it sees EOF and exits cleanly;
+        # the next request respawns it with the new settings. NOTE: do NOT send
+        # it the 'delete' RPC command here — that unlinks the account's local
+        # sqlite3 database and data directory (see JMAP::DB::delete), which
+        # would wipe the just-synced mail cache instead of just restarting it.
+        delete $backend{$aid};
+        $req->respond([200, 'ok',
+          { 'Content-Type' => 'application/json' },
+          JSON::XS::encode_json({ accountid => $aid })]);
+      }, $fail);
+    }, $fail);
+    return;
+  }
+
   if ($path =~ m{^/api/accounts/([^/]+)$} && $method eq 'delete') {
     my $aid = $1;
     $httpd->stop_request();
@@ -4499,9 +4550,11 @@ sub mgmt_dashboard {
     tr:hover { background: #f8f9fa; }
     button, input[type=submit] { padding: 6px 14px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }
     .btn-sync { background: #3498db; color: white; }
+    .btn-edit { background: #f39c12; color: white; }
     .btn-delete { background: #e74c3c; color: white; }
     .btn-add { background: #27ae60; color: white; padding: 10px 20px; font-size: 16px; }
     .btn-sync:hover { background: #2980b9; }
+    .btn-edit:hover { background: #d68910; }
     .btn-delete:hover { background: #c0392b; }
     .btn-add:hover { background: #219a52; }
     .actions { display: flex; gap: 6px; }
@@ -4531,7 +4584,7 @@ sub mgmt_dashboard {
   <button class="btn-add" onclick="toggleForm()">+ Add Account</button>
 
   <div id="add-form" class="card hidden" style="margin-top: 20px;">
-    <h2>Add Account</h2>
+    <h2 id="form-title">Add Account</h2>
     <div class="form-group"><label>Account ID</label><input id="f-aid" placeholder="user1"></div>
     <div class="form-group"><label>Type</label><input id="f-type" value="imap"></div>
     <div class="form-group"><label>IMAP Host</label><input id="f-host" placeholder="imap.example.com"></div>
@@ -4539,16 +4592,17 @@ sub mgmt_dashboard {
     <div class="form-group"><label>IMAP Encryption</label>
       <select id="f-ssl">
         <option value="2" selected>SSL/TLS (implicit, usually port 993)</option>
+        <option value="3">STARTTLS (usually port 143)</option>
         <option value="1">None (plaintext, usually port 143)</option>
       </select>
     </div>
     <div class="form-group"><label>Username</label><input id="f-user" placeholder="user@example.com"></div>
-    <div class="form-group"><label>Password</label><input id="f-pass" type="password"></div>
+    <div class="form-group"><label>Password</label><input id="f-pass" type="password" placeholder=""></div>
     <div class="form-group"><label>CalDAV URL (optional)</label><input id="f-caldav" placeholder="https://example.com"></div>
     <div class="form-group"><label>CardDAV URL (optional)</label><input id="f-carddav" placeholder="https://example.com"></div>
     <div class="form-group"><label>WebDAV URL (files, optional)</label><input id="f-webdav" placeholder="https://example.com/dav/drive/user/me/"></div>
     <div style="margin-top: 16px;">
-      <button class="btn-add" onclick="addAccount()">Create Account</button>
+      <button class="btn-add" id="form-submit" onclick="saveAccount()">Create Account</button>
     </div>
   </div>
 </div>
@@ -4572,6 +4626,7 @@ function loadAccounts() {
         + '<td>' + (a.messages || 0) + '</td>'
         + '<td class="actions">'
         + '<button class="btn-sync" onclick="syncAccount(\'' + a.accountid + '\')">Sync</button>'
+        + '<button class="btn-edit" onclick="editAccount(\'' + a.accountid + '\')">Edit</button>'
         + '<button class="btn-delete" onclick="deleteAccount(\'' + a.accountid + '\')">Delete</button>'
         + '</td>';
       tb.appendChild(tr);
@@ -4589,25 +4644,82 @@ function deleteAccount(aid) {
     .then(r => r.json())
     .then(d => { msg('Deleted ' + aid, true); loadAccounts(); });
 }
-function toggleForm() { document.getElementById('add-form').classList.toggle('hidden'); }
-function addAccount() {
+var editingAccountId = null;
+function toggleForm() {
+  editingAccountId = null;
+  document.getElementById('form-title').textContent = 'Add Account';
+  document.getElementById('form-submit').textContent = 'Create Account';
+  document.getElementById('f-aid').disabled = false;
+  document.getElementById('f-aid').value = '';
+  document.getElementById('f-type').value = 'imap';
+  document.getElementById('f-host').value = '';
+  document.getElementById('f-port').value = '993';
+  document.getElementById('f-ssl').value = '2';
+  document.getElementById('f-user').value = '';
+  document.getElementById('f-pass').value = '';
+  document.getElementById('f-pass').placeholder = '';
+  document.getElementById('f-caldav').value = '';
+  document.getElementById('f-carddav').value = '';
+  document.getElementById('f-webdav').value = '';
+  document.getElementById('add-form').classList.toggle('hidden');
+}
+function editAccount(aid) {
+  fetch('/api/accounts/' + aid).then(r => r.json()).then(a => {
+    editingAccountId = aid;
+    document.getElementById('form-title').textContent = 'Edit Account: ' + aid;
+    document.getElementById('form-submit').textContent = 'Save Changes';
+    document.getElementById('f-aid').value = aid;
+    document.getElementById('f-aid').disabled = true;
+    document.getElementById('f-type').value = a.type || 'imap';
+    document.getElementById('f-host').value = a.imapHost || '';
+    document.getElementById('f-port').value = a.imapPort || 993;
+    document.getElementById('f-ssl').value = sslChoice(a.imapSSL);
+    document.getElementById('f-user').value = a.username || '';
+    document.getElementById('f-pass').value = '';
+    document.getElementById('f-pass').placeholder = 'Leave blank to keep current password';
+    document.getElementById('f-caldav').value = a.caldavURL || '';
+    document.getElementById('f-carddav').value = a.carddavURL || '';
+    document.getElementById('f-webdav').value = a.webdavURL || '';
+    document.getElementById('add-form').classList.remove('hidden');
+  });
+}
+// imapSSL: 0 and 1 are both plaintext, 2 is TLS, 3 STARTTLS. Only a missing
+// value means "not chosen" and defaults to TLS; a stored 0 must not turn into
+// TLS just because the account was edited.
+function sslChoice(v) {
+  if (v === undefined || v === null || v === '') return '2';
+  v = Number(v);
+  return String(v === 0 ? 1 : v);
+}
+function sslValue() {
+  var v = parseInt(document.getElementById('f-ssl').value, 10);
+  return isNaN(v) ? 2 : v;
+}
+function saveAccount() {
   var body = {
     accountid: document.getElementById('f-aid').value,
     type: document.getElementById('f-type').value,
     imapHost: document.getElementById('f-host').value,
     imapPort: parseInt(document.getElementById('f-port').value) || 993,
-    imapSSL: parseInt(document.getElementById('f-ssl').value) || 2,
+    imapSSL: sslValue(),
     username: document.getElementById('f-user').value,
     password: document.getElementById('f-pass').value,
     caldavURL: document.getElementById('f-caldav').value,
     carddavURL: document.getElementById('f-carddav').value,
     webdavURL: (document.getElementById('f-webdav') || {}).value || '',
   };
-  fetch('/api/accounts', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) })
-    .then(r => r.json())
+  var editAid = editingAccountId;
+  var req = editAid
+    ? fetch('/api/accounts/' + editAid, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) })
+    : fetch('/api/accounts', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+  req.then(r => r.json())
     .then(d => {
       if (d.error) { msg('Error: ' + d.error, false); }
-      else { msg('Created ' + d.accountid, true); document.getElementById('add-form').classList.add('hidden'); loadAccounts(); }
+      else {
+        msg((editAid ? 'Updated ' : 'Created ') + d.accountid, true);
+        document.getElementById('add-form').classList.add('hidden');
+        loadAccounts();
+      }
     });
 }
 loadAccounts();
