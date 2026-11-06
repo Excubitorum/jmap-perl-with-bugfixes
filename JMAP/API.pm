@@ -484,8 +484,13 @@ sub handle_request {
 
   my $methods = $request->{methodCalls};
 
+  # JmapDB, for a passthrough account, has no IMAP backend to time
+  my $timed = $Self->{db}->can('take_backend_stats');
+
   foreach my $item (@$methods) {
     my $t0 = [gettimeofday];
+    # anything the backend did before this method (a sync, the last method) isn't its time
+    $Self->{db}->take_backend_stats() if $timed;
     my ($command, $args, $tag) = @$item;
     my @items;
     my $can = $command;
@@ -589,6 +594,13 @@ sub handle_request {
     }
     $Self->push_results($tag, @items);
     my $elapsed = tv_interval ($t0);
+    if (my %stats = $timed ? %{ $Self->{db}->take_backend_stats() } : ()) {
+      # "imap_fetch 2x0.412": the calls this method made, slowest first
+      $logbit .= ' backend[' . join(', ', map {
+        my ($n, $secs) = @{$stats{$_}};
+        sprintf('%s %s%.3f', $_, $n > 1 ? "${n}x" : '', $secs);
+      } sort { $stats{$b}[1] <=> $stats{$a}[1] } keys %stats) . ']';
+    }
     warn "JMAP CMD $command$logbit took " . $elapsed . "\n";
   }
 

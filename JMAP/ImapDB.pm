@@ -23,6 +23,7 @@ use Data::JSEmail;
 use Email::Simple;
 use Text::JSContact qw(vcard_to_jscontact jscontact_to_vcard);
 use Data::Dumper;
+use Time::HiRes qw(gettimeofday tv_interval);
 use JMAP::Sync::Gmail;
 use JMAP::Sync::Standard;
 use JMAP::FileNode;
@@ -200,11 +201,17 @@ sub _backend_call {
   # Our caller's context, not the eval's: inside the block wantarray is false
   my $list = wantarray;
   my @res;
+  my $t0 = [gettimeofday];
   my $ok = eval {
     @res = $list ? $Self->{backend}->$cmd(@args) : scalar $Self->{backend}->$cmd(@args);
     1;
   };
   my $err = $@;
+  # Counted before anything can die: a call that failed or timed out is often
+  # exactly the slow one the log line is meant to show.
+  my $stat = $Self->{backend_stats}{$cmd} ||= [0, 0];
+  $stat->[0]++;
+  $stat->[1] += tv_interval($t0);
 
   # Checked whether or not the command died: many die on the undef a broken
   # read returns ("SELECT FAILED"), and the dead connection must still be
@@ -217,6 +224,14 @@ sub _backend_call {
   die "IMAP connection lost during $cmd\n" if $lost;
 
   return wantarray ? @res : $res[0];
+}
+
+# What the backend calls since the last take cost: {cmd => [count, seconds]}.
+# The API logs it beside each method's time, which says how much of a slow
+# method was spent waiting on the server.
+sub take_backend_stats {
+  my $Self = shift;
+  return delete($Self->{backend_stats}) || {};
 }
 
 # synchronise list from IMAP server to local folder cache
